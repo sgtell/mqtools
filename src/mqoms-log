@@ -1,0 +1,287 @@
+#!/usr/bin/python3
+#
+# watch mqtt for a specified list of topics.
+# do some trivial processing and log each burst of data to a file
+# in a space/tab separated format, for offline plotting
+#
+#
+
+mqhost="localhost"
+
+topics = [
+    # mqtt topic 	            type
+    [ "omnistat/test80/cool_set",  float], 
+    [ "omnistat/test80/heat_set",  float], 
+    [ "omnistat/test80/setpoint",  float], 
+    [ "omnistat/test80/current",   float], 
+    [ "omnistat/test80/curmode",   str], 
+    [ "omnistat/test80/outstatus", str], 
+    [ "omnistat/test2k/cool_set",  float], 
+    [ "omnistat/test2k/heat_set",  float], 
+    [ "omnistat/test2k/setpoint",  float], 
+    [ "omnistat/test2k/current" ,  float ], 
+    [ "omnistat/test2k/curmode",   str], 
+    [ "omnistat/test2k/outstatus", str], 
+    ]
+
+log_items = [
+     "omnistat/test80/setpoint", 
+     "omnistat/test80/current",  
+     "omnistat/test80/outstatus",
+     "omnistat/test2k/setpoint", 
+     "omnistat/test2k/current",  
+     "omnistat/test2k/outstatus",
+    ]
+
+import re
+import time
+import argparse
+import os
+import sys
+import pprint
+import paho.mqtt.client as mqtt
+import re
+from select import select
+import traceback
+
+sys.path.append('/home/tell/proj/python')
+
+from perlish import *
+
+parser =  argparse.ArgumentParser(description="subscribe to several mqtt topics and log their values periodicly");
+parser.add_argument("--verbose", "-v", default=False, action='store_true');
+args = parser.parse_args();
+
+mq = None
+topicinfo = None
+nmsgs = 0
+log_fp = None
+tm = time.localtime()
+last_day = tm.tm_mday
+
+def init_topicinfo():
+    global topicinfo
+    topicinfo = dict()
+    for titem in list(topics):
+        t = titem[0]
+        ttype = titem[1]
+        topicinfo[t] = dict()
+        td = topicinfo[t] 
+        td['last'] = None
+        td['type'] = ttype
+        td['lasttime'] = 0
+    printf("topicinfo=%s\n", str(topicinfo));
+
+def log_open():
+    "open or re-open a logfile"
+    global log_fp;
+    if(log_fp):
+        log_fp.close()
+        log_fp = None
+    fname = sprintf("mdlog.%s", time.strftime("%y%m%d"))
+    log_fp = open(fname, "a");
+    log_header(log_fp);
+    printf("opened logfile: %s\n", fname);
+    
+def log_header(fp):
+    fprintf(fp, "# %s\n", time.strftime("%H:%M %A %B %Y"))
+    fprintf(fp, "# time");
+    for item in log_items:
+        fprintf(fp, " %s", item);
+    fprintf(fp, "\n");
+
+def log_output(fp):
+    global topicinfo
+    now = time.time()
+    fprintf(fp, "%s ", time.strftime("%H:%M"))
+    for item in log_items:
+        ti = topicinfo[item];
+        if(now - ti['lasttime'] < 90):
+            if(ti['last'] == None):
+                fprintf(fp, " -");
+            else:
+                if(ti['type'] == float):
+                    fprintf(fp, " %6.1f", ti['last'])
+                else:
+                    fprintf(fp, " %s", str(ti['last']))
+        else:
+            fprintf(fp, " -");
+    fprintf(fp, "\n");
+    log_fp.flush()
+    
+def print_current():
+    "print current info on all known topics"
+    global topicinfo
+    for t, td in topicinfo.items():
+        printf(" %30s %12d %10s\n", t, td['lasttime'], str(td['last']))
+    printf("\n");
+
+def update_setpoint(tprefix):
+    curmode = topicinfo[tprefix + "/curmode"]['last']
+    if(curmode == 'heat'):
+        topicinfo[tprefix + "/setpoint"]['last'] = topicinfo[tprefix + "/heat_set"]['last']
+        topicinfo[tprefix + "/setpoint"]['lasttime'] = topicinfo[tprefix + "/heat_set"]['lasttime']
+    elif(curmode == 'cool'):
+        topicinfo[tprefix + "/setpoint"]['last'] = topicinfo[tprefix + "/cool_set"]['last']
+        topicinfo[tprefix + "/setpoint"]['lasttime'] = topicinfo[tprefix + "/cool_set"]['lasttime']
+    else:
+        topicinfo[tprefix + "/setpoint"]['last'] = None
+        topicinfo[tprefix + "/setpoint"]['lasttime'] = time.time()
+        
+def update_generated_info():
+    "compute derived info from current values"
+    update_setpoint("omnistat/test80")
+    update_setpoint("omnistat/test2k")
+    
+def main():
+    global mq
+    init_topicinfo()
+    mq = mqtt.Client()
+    mq.on_connect = on_connect
+    mq.on_discconnect = on_disconnect
+    mq.on_message = on_message
+    mq.connect(mqhost, 1883, keepalive=90)
+    mq.reconnect_delay_set(min_delay=1, max_delay=120);
+    log_open()
+    selectloop()
+    
+def on_connect(mq, userdata, flags, rc):
+    print("Connected with result code "+str(rc))
+    # Subscribing in on_connect() means that if we lose the connection and
+    # reconnect then subscriptions will be renewed.
+    if(mq):
+        mq.subscribe("omnistat/#")
+
+def on_disconnect(mq, userdata, rc):
+    if(args.verbose):
+        printf("on_disconnect\n");
+    mqtt_reconnect()
+    
+def mqtt_reconnect():
+    global mq
+    try:
+        mq.reconnect()
+    except ConnectionRefusedError:
+        # if the server is not running,
+        # then the host rejects the connection
+        # and a ConnectionRefusedError is thrown
+        # getting this error > continue trying to
+        # connect
+        pass
+        
+# The callback for when a PUBLISH message is received from the server.
+# NB:  somehow the mqtt stuff catches and supresses exeptions from these
+# callbacks, so if there are any errors, they fail silently.
+#  keeps things running, but difficult to debug.
+def on_message(client, userdata, msg):
+    try:
+        on_message_inner(client, userdata, msg)
+    except Exception as e:
+        #printf("Exception in on_message: %s\n", str(e))
+        traceback.print_exc()
+
+def on_message_inner(client, userdata, msg):
+    global topicinfo
+    global nmsgs
+    if(args.verbose):
+        #printf("message %s\n", str(msg))
+        printf(" message topic=\"%s\" payload=%s\n", msg.topic, msg.payload)
+        #    topic = re.split("/", msg.topic)
+#    printf("topic=%s\n", str(topic))
+    handled = False
+#    if(topic[0] == 'aptstage'):
+    if(msg.topic in topicinfo):
+        nmsgs += 1
+        handled = True
+        topicinfo[msg.topic]['lasttime'] = time.time()
+        ttype = topicinfo[msg.topic]['type']
+        if(ttype == float):
+            s = msg.payload.decode('ascii')
+            topicinfo[msg.topic]['last'] = float(s)
+        elif(ttype == str):
+             topicinfo[msg.topic]['last'] = msg.payload.decode('ascii')
+        elif(ttype == int):
+             s = msg.payload.decode('ascii')
+             topicinfo[msg.topic]['last'] = int(s, 0);
+        else:
+             topicinfo[msg.topic]['last'] = msg.payload
+                         
+    # TODO want to figure out if we've got all of them for the most recent burst
+    #  and then batch process them all.
+    # need some sort of timer.   might as well do our own select loop.
+
+def select_timeout():
+    global args
+    global nmsgs, topicinfo
+    global log_fp
+    if(args.verbose):
+        printf("select_timeout\n");
+    global last_day
+    tm = time.localtime()
+    if(tm.tm_mday != last_day):
+        log_open()  # reopen with new date
+        last_day = tm.tm_mday
+        
+    if(nmsgs>0):
+        nmsgs = 0
+        #printf("curdata=%s\n", str(topicinfo))
+        update_generated_info()
+        print_current()
+        log_output(log_fp)
+    
+def selectloop():
+    global mq
+    # select loop for mqtt and joystick
+    printf("starting select loop\n")
+    t0 = time.time();
+    t_alive = t0;
+    while(True):
+        any_mq = False
+        if(mq):
+            mqsocket = mq.socket()
+        # js_fd = js.fd()
+        #rlist = [js_fd]
+        rlist = []
+        t_now = time.time();
+        if(mqsocket):
+            rlist.append(mqsocket)
+            t0 = t_now
+        else:
+            t1 = t_now
+            if(t1 - t0 > 2):
+                t0 = t1
+                printf("mqsocket is %s, attempting reconnect\n", mqsocket)
+                mqtt_reconnect()
+                
+        wlist = [];
+        xlist = [];
+        if(mq.want_write()):
+            wlist.append(mqsocket)
+
+        try:
+            (rlist, wlist, xlist) = select(rlist, wlist, xlist, 2.000)
+        except TypeError as e:
+            print(e)
+            print(rlist, wlist, xlist)
+            exit(1)
+
+        for fd in rlist:
+            if(fd is mqsocket):
+                mq.loop_read()
+                any_mq = True
+            #if(fd is js_fd):
+            #    js.loop_read()
+
+        for fd in wlist:
+            if(fd is mqsocket):
+                mq.loop_write()
+                any_mq = True
+
+#        if(t_now - t_alive > 15):
+#            mq.keepalive_timeout()
+#            t_alive = t_now
+
+        if(not any_mq):
+            select_timeout()
+            
+main()
